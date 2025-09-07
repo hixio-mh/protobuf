@@ -1,56 +1,103 @@
+// Copyright 2023 Google LLC
+//
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT.
 
-/*
- * http://www.unicode.org/versions/Unicode6.0.0/ch03.pdf - page 94
+/* This is a wrapper for the Google range-sse.cc algorithm which checks whether
+ * a sequence of bytes is a valid UTF-8 sequence and finds the longest valid
+ * prefix of the UTF-8 sequence.
  *
- * Table 3-7. Well-Formed UTF-8 Byte Sequences
+ * The key difference is that it checks for as much ASCII symbols as possible
+ * and then falls back to the range-sse.cc algorithm. The changes to the
+ * algorithm are cosmetic, mostly to trick the clang compiler to produce optimal
+ * code.
  *
- * +--------------------+------------+-------------+------------+-------------+
- * | Code Points        | First Byte | Second Byte | Third Byte | Fourth Byte |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+0000..U+007F     | 00..7F     |             |            |             |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+0080..U+07FF     | C2..DF     | 80..BF      |            |             |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+0800..U+0FFF     | E0         | A0..BF      | 80..BF     |             |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+1000..U+CFFF     | E1..EC     | 80..BF      | 80..BF     |             |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+D000..U+D7FF     | ED         | 80..9F      | 80..BF     |             |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+E000..U+FFFF     | EE..EF     | 80..BF      | 80..BF     |             |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+10000..U+3FFFF   | F0         | 90..BF      | 80..BF     | 80..BF      |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+40000..U+FFFFF   | F1..F3     | 80..BF      | 80..BF     | 80..BF      |
- * +--------------------+------------+-------------+------------+-------------+
- * | U+100000..U+10FFFF | F4         | 80..8F      | 80..BF     | 80..BF      |
- * +--------------------+------------+-------------+------------+-------------+
+ * For API see the utf8_validity.h header.
  */
+#include "utf8_range.h"
 
-/* Return 0 - success,  >0 - index(1 based) of first error char */
-int utf8_naive(const unsigned char* data, int len) {
-  int err_pos = 1;
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
-  while (len) {
-    int bytes;
+#if defined(__GNUC__)
+#define FORCE_INLINE_ATTR __attribute__((always_inline)) inline
+#elif defined(_MSC_VER)
+#define FORCE_INLINE_ATTR __forceinline
+#else
+#define FORCE_INLINE_ATTR inline
+#endif
+
+static FORCE_INLINE_ATTR uint64_t utf8_range_UnalignedLoad64(
+    const void* p) {
+  uint64_t t;
+  memcpy(&t, p, sizeof t);
+  return t;
+}
+
+static FORCE_INLINE_ATTR int utf8_range_AsciiIsAscii(unsigned char c) {
+  return c < 128;
+}
+
+static FORCE_INLINE_ATTR int utf8_range_IsTrailByteOk(const char c) {
+  return (int8_t)(c) <= (int8_t)(0xBF);
+}
+
+/* If return_position is false then it returns 1 if |data| is a valid utf8
+ * sequence, otherwise returns 0.
+ * If return_position is set to true, returns the length in bytes of the prefix
+   of |data| that is all structurally valid UTF-8.
+ */
+static size_t utf8_range_ValidateUTF8Naive(const char* data, const char* end,
+                                           int return_position) {
+  /* We return err_pos in the loop which is always 0 if !return_position */
+  size_t err_pos = 0;
+  size_t codepoint_bytes = 0;
+  /* The early check is done because of early continue's on codepoints of all
+   * sizes, i.e. we first check for ascii and if it is, we call continue, then
+   * for 2 byte codepoints, etc. This is done in order to reduce indentation and
+   * improve readability of the codepoint validity check.
+   */
+  while (data + codepoint_bytes < end) {
+    if (return_position) {
+      err_pos += codepoint_bytes;
+    }
+    data += codepoint_bytes;
+    const size_t len = end - data;
     const unsigned char byte1 = data[0];
 
-    /* 00..7F */
-    if (byte1 <= 0x7F) {
-      bytes = 1;
-      /* C2..DF, 80..BF */
-    } else if (len >= 2 && byte1 >= 0xC2 && byte1 <= 0xDF &&
-               (signed char)data[1] <= (signed char)0xBF) {
-      bytes = 2;
-    } else if (len >= 3) {
+    /* We do not skip many ascii bytes at the same time as this function is
+       used for tail checking (< 16 bytes) and for non x86 platforms. We also
+       don't think that cases where non-ASCII codepoints are followed by ascii
+       happen often. For small strings it also introduces some penalty. For
+       purely ascii UTF8 strings (which is the overwhelming case) we call
+       SkipAscii function which is multiplatform and extremely fast.
+     */
+    /* [00..7F] ASCII -> 1 byte */
+    if (utf8_range_AsciiIsAscii(byte1)) {
+      codepoint_bytes = 1;
+      continue;
+    }
+    /* [C2..DF], [80..BF] -> 2 bytes */
+    if (len >= 2 && byte1 >= 0xC2 && byte1 <= 0xDF &&
+        utf8_range_IsTrailByteOk(data[1])) {
+      codepoint_bytes = 2;
+      continue;
+    }
+    if (len >= 3) {
       const unsigned char byte2 = data[1];
+      const unsigned char byte3 = data[2];
 
-      /* Is byte2, byte3 between 0x80 ~ 0xBF */
-      const int byte2_ok = (signed char)byte2 <= (signed char)0xBF;
-      const int byte3_ok = (signed char)data[2] <= (signed char)0xBF;
+      /* Is byte2, byte3 between [0x80, 0xBF]
+       * Check for 0x80 was done above.
+       */
+      if (!utf8_range_IsTrailByteOk(byte2) ||
+          !utf8_range_IsTrailByteOk(byte3)) {
+        return err_pos;
+      }
 
-      if (byte2_ok && byte3_ok &&
-          /* E0, A0..BF, 80..BF */
+      if (/* E0, A0..BF, 80..BF */
           ((byte1 == 0xE0 && byte2 >= 0xA0) ||
            /* E1..EC, 80..BF, 80..BF */
            (byte1 >= 0xE1 && byte1 <= 0xEC) ||
@@ -58,338 +105,103 @@ int utf8_naive(const unsigned char* data, int len) {
            (byte1 == 0xED && byte2 <= 0x9F) ||
            /* EE..EF, 80..BF, 80..BF */
            (byte1 >= 0xEE && byte1 <= 0xEF))) {
-        bytes = 3;
-      } else if (len >= 4) {
+        codepoint_bytes = 3;
+        continue;
+      }
+      if (len >= 4) {
+        const unsigned char byte4 = data[3];
         /* Is byte4 between 0x80 ~ 0xBF */
-        const int byte4_ok = (signed char)data[3] <= (signed char)0xBF;
+        if (!utf8_range_IsTrailByteOk(byte4)) {
+          return err_pos;
+        }
 
-        if (byte2_ok && byte3_ok && byte4_ok &&
-            /* F0, 90..BF, 80..BF, 80..BF */
+        if (/* F0, 90..BF, 80..BF, 80..BF */
             ((byte1 == 0xF0 && byte2 >= 0x90) ||
              /* F1..F3, 80..BF, 80..BF, 80..BF */
              (byte1 >= 0xF1 && byte1 <= 0xF3) ||
              /* F4, 80..8F, 80..BF, 80..BF */
              (byte1 == 0xF4 && byte2 <= 0x8F))) {
-          bytes = 4;
-        } else {
-          return err_pos;
+          codepoint_bytes = 4;
+          continue;
         }
-      } else {
-        return err_pos;
       }
-    } else {
-      return err_pos;
     }
-
-    len -= bytes;
-    err_pos += bytes;
-    data += bytes;
+    return err_pos;
   }
+  if (return_position) {
+    err_pos += codepoint_bytes;
+  }
+  /* if return_position is false, this returns 1.
+   * if return_position is true, this returns err_pos.
+   */
+  return err_pos + (1 - return_position);
+}
 
+#if defined(__SSE4_1__) || (defined(__ARM_NEON) && defined(__ARM_64BIT_STATE))
+/* Returns the number of bytes needed to skip backwards to get to the first
+   byte of codepoint.
+ */
+static inline int utf8_range_CodepointSkipBackwards(int32_t codepoint_word) {
+  const int8_t* const codepoint = (const int8_t*)(&codepoint_word);
+  if (!utf8_range_IsTrailByteOk(codepoint[3])) {
+    return 1;
+  } else if (!utf8_range_IsTrailByteOk(codepoint[2])) {
+    return 2;
+  } else if (!utf8_range_IsTrailByteOk(codepoint[1])) {
+    return 3;
+  }
   return 0;
 }
+#endif  // __SSE4_1__
 
-#ifdef __SSE4_1__
-
-#include <stdint.h>
-#include <stdio.h>
-#include <x86intrin.h>
-
-int utf8_naive(const unsigned char* data, int len);
-
-static const int8_t _first_len_tbl[] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3,
-};
-
-static const int8_t _first_range_tbl[] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8,
-};
-
-static const int8_t _range_min_tbl[] = {
-    0x00, 0x80, 0x80, 0x80, 0xA0, 0x80, 0x90, 0x80,
-    0xC2, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
-};
-static const int8_t _range_max_tbl[] = {
-    0x7F, 0xBF, 0xBF, 0xBF, 0xBF, 0x9F, 0xBF, 0x8F,
-    0xF4, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-};
-
-static const int8_t _df_ee_tbl[] = {
-    0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0,
-};
-static const int8_t _ef_fe_tbl[] = {
-    0, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-};
-
-/* Return 0 on success, -1 on error */
-int utf8_range2(const unsigned char* data, int len) {
-  if (len >= 32) {
-    __m128i prev_input = _mm_set1_epi8(0);
-    __m128i prev_first_len = _mm_set1_epi8(0);
-
-    const __m128i first_len_tbl =
-        _mm_loadu_si128((const __m128i*)_first_len_tbl);
-    const __m128i first_range_tbl =
-        _mm_loadu_si128((const __m128i*)_first_range_tbl);
-    const __m128i range_min_tbl =
-        _mm_loadu_si128((const __m128i*)_range_min_tbl);
-    const __m128i range_max_tbl =
-        _mm_loadu_si128((const __m128i*)_range_max_tbl);
-    const __m128i df_ee_tbl = _mm_loadu_si128((const __m128i*)_df_ee_tbl);
-    const __m128i ef_fe_tbl = _mm_loadu_si128((const __m128i*)_ef_fe_tbl);
-
-    __m128i error = _mm_set1_epi8(0);
-
-    while (len >= 32) {
-      /***************************** block 1 ****************************/
-      const __m128i input_a = _mm_loadu_si128((const __m128i*)data);
-
-      __m128i high_nibbles =
-          _mm_and_si128(_mm_srli_epi16(input_a, 4), _mm_set1_epi8(0x0F));
-
-      __m128i first_len_a = _mm_shuffle_epi8(first_len_tbl, high_nibbles);
-
-      __m128i range_a = _mm_shuffle_epi8(first_range_tbl, high_nibbles);
-
-      range_a = _mm_or_si128(range_a,
-                             _mm_alignr_epi8(first_len_a, prev_first_len, 15));
-
-      __m128i tmp;
-      tmp = _mm_alignr_epi8(first_len_a, prev_first_len, 14);
-      tmp = _mm_subs_epu8(tmp, _mm_set1_epi8(1));
-      range_a = _mm_or_si128(range_a, tmp);
-
-      tmp = _mm_alignr_epi8(first_len_a, prev_first_len, 13);
-      tmp = _mm_subs_epu8(tmp, _mm_set1_epi8(2));
-      range_a = _mm_or_si128(range_a, tmp);
-
-      __m128i shift1, pos, range2;
-      shift1 = _mm_alignr_epi8(input_a, prev_input, 15);
-      pos = _mm_sub_epi8(shift1, _mm_set1_epi8(0xEF));
-      tmp = _mm_subs_epu8(pos, _mm_set1_epi8(0xF0));
-      range2 = _mm_shuffle_epi8(df_ee_tbl, tmp);
-      tmp = _mm_adds_epu8(pos, _mm_set1_epi8(0x70));
-      range2 = _mm_add_epi8(range2, _mm_shuffle_epi8(ef_fe_tbl, tmp));
-
-      range_a = _mm_add_epi8(range_a, range2);
-
-      __m128i minv = _mm_shuffle_epi8(range_min_tbl, range_a);
-      __m128i maxv = _mm_shuffle_epi8(range_max_tbl, range_a);
-
-      tmp = _mm_or_si128(_mm_cmplt_epi8(input_a, minv),
-                         _mm_cmpgt_epi8(input_a, maxv));
-      error = _mm_or_si128(error, tmp);
-
-      /***************************** block 2 ****************************/
-      const __m128i input_b = _mm_loadu_si128((const __m128i*)(data + 16));
-
-      high_nibbles =
-          _mm_and_si128(_mm_srli_epi16(input_b, 4), _mm_set1_epi8(0x0F));
-
-      __m128i first_len_b = _mm_shuffle_epi8(first_len_tbl, high_nibbles);
-
-      __m128i range_b = _mm_shuffle_epi8(first_range_tbl, high_nibbles);
-
-      range_b =
-          _mm_or_si128(range_b, _mm_alignr_epi8(first_len_b, first_len_a, 15));
-
-      tmp = _mm_alignr_epi8(first_len_b, first_len_a, 14);
-      tmp = _mm_subs_epu8(tmp, _mm_set1_epi8(1));
-      range_b = _mm_or_si128(range_b, tmp);
-
-      tmp = _mm_alignr_epi8(first_len_b, first_len_a, 13);
-      tmp = _mm_subs_epu8(tmp, _mm_set1_epi8(2));
-      range_b = _mm_or_si128(range_b, tmp);
-
-      shift1 = _mm_alignr_epi8(input_b, input_a, 15);
-      pos = _mm_sub_epi8(shift1, _mm_set1_epi8(0xEF));
-      tmp = _mm_subs_epu8(pos, _mm_set1_epi8(0xF0));
-      range2 = _mm_shuffle_epi8(df_ee_tbl, tmp);
-      tmp = _mm_adds_epu8(pos, _mm_set1_epi8(0x70));
-      range2 = _mm_add_epi8(range2, _mm_shuffle_epi8(ef_fe_tbl, tmp));
-
-      range_b = _mm_add_epi8(range_b, range2);
-
-      minv = _mm_shuffle_epi8(range_min_tbl, range_b);
-      maxv = _mm_shuffle_epi8(range_max_tbl, range_b);
-
-      tmp = _mm_or_si128(_mm_cmplt_epi8(input_b, minv),
-                         _mm_cmpgt_epi8(input_b, maxv));
-      error = _mm_or_si128(error, tmp);
-
-      /************************ next iteration **************************/
-      prev_input = input_b;
-      prev_first_len = first_len_b;
-
-      data += 32;
-      len -= 32;
-    }
-
-    if (!_mm_testz_si128(error, error)) return -1;
-
-    int32_t token4 = _mm_extract_epi32(prev_input, 3);
-    const int8_t* token = (const int8_t*)&token4;
-    int lookahead = 0;
-    if (token[3] > (int8_t)0xBF)
-      lookahead = 1;
-    else if (token[2] > (int8_t)0xBF)
-      lookahead = 2;
-    else if (token[1] > (int8_t)0xBF)
-      lookahead = 3;
-
-    data -= lookahead;
-    len += lookahead;
+/* Skipping over ASCII as much as possible, per 8 bytes. It is intentional
+   as most strings to check for validity consist only of 1 byte codepoints.
+ */
+static inline const char* utf8_range_SkipAscii(const char* data,
+                                               const char* end) {
+  while (8 <= end - data &&
+         (utf8_range_UnalignedLoad64(data) & 0x8080808080808080) == 0) {
+    data += 8;
   }
-
-  return utf8_naive(data, len);
+  while (data < end && utf8_range_AsciiIsAscii(*data)) {
+    ++data;
+  }
+  return data;
 }
 
+#if defined(__SSE4_1__)
+#include "utf8_range_sse.inc"
+#elif defined(__ARM_NEON) && defined(__ARM_64BIT_STATE)
+#include "utf8_range_neon.inc"
 #endif
 
-#ifdef __ARM_NEON
-
-#include <arm_neon.h>
-#include <stdint.h>
-#include <stdio.h>
-
-int utf8_naive(const unsigned char* data, int len);
-
-static const uint8_t _first_len_tbl[] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3,
-};
-
-static const uint8_t _first_range_tbl[] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8,
-};
-
-static const uint8_t _range_min_tbl[] = {
-    0x00, 0x80, 0x80, 0x80, 0xA0, 0x80, 0x90, 0x80,
-    0xC2, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-};
-static const uint8_t _range_max_tbl[] = {
-    0x7F, 0xBF, 0xBF, 0xBF, 0xBF, 0x9F, 0xBF, 0x8F,
-    0xF4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-static const uint8_t _range_adjust_tbl[] = {
-    2, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0,
-};
-
-/* Return 0 on success, -1 on error */
-int utf8_range2(const unsigned char* data, int len) {
-  if (len >= 32) {
-    uint8x16_t prev_input = vdupq_n_u8(0);
-    uint8x16_t prev_first_len = vdupq_n_u8(0);
-
-    const uint8x16_t first_len_tbl = vld1q_u8(_first_len_tbl);
-    const uint8x16_t first_range_tbl = vld1q_u8(_first_range_tbl);
-    const uint8x16_t range_min_tbl = vld1q_u8(_range_min_tbl);
-    const uint8x16_t range_max_tbl = vld1q_u8(_range_max_tbl);
-    const uint8x16x2_t range_adjust_tbl = vld2q_u8(_range_adjust_tbl);
-
-    const uint8x16_t const_1 = vdupq_n_u8(1);
-    const uint8x16_t const_2 = vdupq_n_u8(2);
-    const uint8x16_t const_e0 = vdupq_n_u8(0xE0);
-
-    uint8x16_t error1 = vdupq_n_u8(0);
-    uint8x16_t error2 = vdupq_n_u8(0);
-    uint8x16_t error3 = vdupq_n_u8(0);
-    uint8x16_t error4 = vdupq_n_u8(0);
-
-    while (len >= 32) {
-      /******************* two blocks interleaved **********************/
-
-#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 8)
-      /* gcc doesn't support vldq1_u8_x2 until version 8 */
-      const uint8x16_t input_a = vld1q_u8(data);
-      const uint8x16_t input_b = vld1q_u8(data + 16);
+static FORCE_INLINE_ATTR size_t utf8_range_Validate(
+    const char* data, size_t len, int return_position) {
+  if (len == 0) return 1 - return_position;
+  // Save buffer start address for later use
+  const char* const data_original = data;
+  const char* const end = data + len;
+  data = utf8_range_SkipAscii(data, end);
+  /* SIMD algorithm always outperforms the naive version for any data of
+     length >=16.
+   */
+  if (end - data < 16) {
+    return (return_position ? (data - data_original) : 0) +
+           utf8_range_ValidateUTF8Naive(data, end, return_position);
+  }
+#if defined(__SSE4_1__) || (defined(__ARM_NEON) && defined(__ARM_64BIT_STATE))
+  return utf8_range_ValidateUTF8Simd(
+      data_original, data, end, return_position);
 #else
-      /* Forces a double load on Clang */
-      const uint8x16x2_t input_pair = vld1q_u8_x2(data);
-      const uint8x16_t input_a = input_pair.val[0];
-      const uint8x16_t input_b = input_pair.val[1];
+  return (return_position ? (data - data_original) : 0) +
+         utf8_range_ValidateUTF8Naive(data, end, return_position);
 #endif
-
-      const uint8x16_t high_nibbles_a = vshrq_n_u8(input_a, 4);
-      const uint8x16_t high_nibbles_b = vshrq_n_u8(input_b, 4);
-
-      const uint8x16_t first_len_a = vqtbl1q_u8(first_len_tbl, high_nibbles_a);
-      const uint8x16_t first_len_b = vqtbl1q_u8(first_len_tbl, high_nibbles_b);
-
-      uint8x16_t range_a = vqtbl1q_u8(first_range_tbl, high_nibbles_a);
-      uint8x16_t range_b = vqtbl1q_u8(first_range_tbl, high_nibbles_b);
-
-      range_a = vorrq_u8(range_a, vextq_u8(prev_first_len, first_len_a, 15));
-      range_b = vorrq_u8(range_b, vextq_u8(first_len_a, first_len_b, 15));
-
-      uint8x16_t tmp1_a, tmp2_a, tmp1_b, tmp2_b;
-      tmp1_a = vextq_u8(prev_first_len, first_len_a, 14);
-      tmp1_a = vqsubq_u8(tmp1_a, const_1);
-      range_a = vorrq_u8(range_a, tmp1_a);
-
-      tmp1_b = vextq_u8(first_len_a, first_len_b, 14);
-      tmp1_b = vqsubq_u8(tmp1_b, const_1);
-      range_b = vorrq_u8(range_b, tmp1_b);
-
-      tmp2_a = vextq_u8(prev_first_len, first_len_a, 13);
-      tmp2_a = vqsubq_u8(tmp2_a, const_2);
-      range_a = vorrq_u8(range_a, tmp2_a);
-
-      tmp2_b = vextq_u8(first_len_a, first_len_b, 13);
-      tmp2_b = vqsubq_u8(tmp2_b, const_2);
-      range_b = vorrq_u8(range_b, tmp2_b);
-
-      uint8x16_t shift1_a = vextq_u8(prev_input, input_a, 15);
-      uint8x16_t pos_a = vsubq_u8(shift1_a, const_e0);
-      range_a = vaddq_u8(range_a, vqtbl2q_u8(range_adjust_tbl, pos_a));
-
-      uint8x16_t shift1_b = vextq_u8(input_a, input_b, 15);
-      uint8x16_t pos_b = vsubq_u8(shift1_b, const_e0);
-      range_b = vaddq_u8(range_b, vqtbl2q_u8(range_adjust_tbl, pos_b));
-
-      uint8x16_t minv_a = vqtbl1q_u8(range_min_tbl, range_a);
-      uint8x16_t maxv_a = vqtbl1q_u8(range_max_tbl, range_a);
-
-      uint8x16_t minv_b = vqtbl1q_u8(range_min_tbl, range_b);
-      uint8x16_t maxv_b = vqtbl1q_u8(range_max_tbl, range_b);
-
-      error1 = vorrq_u8(error1, vcltq_u8(input_a, minv_a));
-      error2 = vorrq_u8(error2, vcgtq_u8(input_a, maxv_a));
-
-      error3 = vorrq_u8(error3, vcltq_u8(input_b, minv_b));
-      error4 = vorrq_u8(error4, vcgtq_u8(input_b, maxv_b));
-
-      /************************ next iteration *************************/
-      prev_input = input_b;
-      prev_first_len = first_len_b;
-
-      data += 32;
-      len -= 32;
-    }
-    error1 = vorrq_u8(error1, error2);
-    error1 = vorrq_u8(error1, error3);
-    error1 = vorrq_u8(error1, error4);
-
-    if (vmaxvq_u8(error1)) return -1;
-
-    uint32_t token4;
-    vst1q_lane_u32(&token4, vreinterpretq_u32_u8(prev_input), 3);
-
-    const int8_t* token = (const int8_t*)&token4;
-    int lookahead = 0;
-    if (token[3] > (int8_t)0xBF)
-      lookahead = 1;
-    else if (token[2] > (int8_t)0xBF)
-      lookahead = 2;
-    else if (token[1] > (int8_t)0xBF)
-      lookahead = 3;
-
-    data -= lookahead;
-    len += lookahead;
-  }
-
-  return utf8_naive(data, len);
 }
 
-#endif
+int utf8_range_IsValid(const char* data, size_t len) {
+  return utf8_range_Validate(data, len, /*return_position=*/0) != 0;
+}
+
+size_t utf8_range_ValidPrefix(const char* data, size_t len) {
+  return utf8_range_Validate(data, len, /*return_position=*/1);
+}

@@ -1,44 +1,23 @@
 // Protocol Buffers - Google's data interchange format
 // Copyright 2008 Google Inc.  All rights reserved.
-// https://developers.google.com/protocol-buffers/
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//     * Redistributions of source code must retain the above copyright
-// notice, this list of conditions and the following disclaimer.
-//     * Redistributions in binary form must reproduce the above
-// copyright notice, this list of conditions and the following disclaimer
-// in the documentation and/or other materials provided with the
-// distribution.
-//     * Neither the name of Google Inc. nor the names of its
-// contributors may be used to endorse or promote products derived from
-// this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 package com.google.protobuf;
 
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static java.util.Collections.singletonList;
+import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.FieldPresenceTestProto.TestAllTypes;
 import com.google.protobuf.UnittestImportLite.ImportEnumLite;
 import com.google.protobuf.UnittestImportPublicLite.PublicImportMessageLite;
 import com.google.protobuf.UnittestLite.ForeignEnumLite;
 import com.google.protobuf.UnittestLite.ForeignMessageLite;
+import com.google.protobuf.UnittestLite.RecursiveGroup;
 import com.google.protobuf.UnittestLite.RecursiveMessage;
 import com.google.protobuf.UnittestLite.TestAllExtensionsLite;
 import com.google.protobuf.UnittestLite.TestAllTypesLite;
@@ -51,16 +30,18 @@ import com.google.protobuf.UnittestLite.TestAllTypesLite.RepeatedGroup;
 import com.google.protobuf.UnittestLite.TestAllTypesLiteOrBuilder;
 import com.google.protobuf.UnittestLite.TestHugeFieldNumbersLite;
 import com.google.protobuf.UnittestLite.TestNestedExtensionLite;
+import com.google.protobuf.testing.Proto3TestingLite.Proto3MessageLite;
+import map_lite_test.MapTestProto.MapContainer;
 import map_lite_test.MapTestProto.TestMap;
 import map_lite_test.MapTestProto.TestMap.MessageValue;
-import protobuf_unittest.NestedExtensionLite;
-import protobuf_unittest.NonNestedExtensionLite;
-import protobuf_unittest.UnittestProto.TestOneof2;
-import protobuf_unittest.lite_equals_and_hash.LiteEqualsAndHash.Bar;
-import protobuf_unittest.lite_equals_and_hash.LiteEqualsAndHash.BarPrime;
-import protobuf_unittest.lite_equals_and_hash.LiteEqualsAndHash.Foo;
-import protobuf_unittest.lite_equals_and_hash.LiteEqualsAndHash.TestOneofEquals;
-import protobuf_unittest.lite_equals_and_hash.LiteEqualsAndHash.TestRecursiveOneof;
+import proto2_unittest.NestedExtensionLite;
+import proto2_unittest.NonNestedExtensionLite;
+import proto2_unittest.UnittestProto.TestOneof2;
+import proto2_unittest.lite_equals_and_hash.LiteEqualsAndHash.Bar;
+import proto2_unittest.lite_equals_and_hash.LiteEqualsAndHash.BarPrime;
+import proto2_unittest.lite_equals_and_hash.LiteEqualsAndHash.Foo;
+import proto2_unittest.lite_equals_and_hash.LiteEqualsAndHash.TestOneofEquals;
+import proto2_unittest.lite_equals_and_hash.LiteEqualsAndHash.TestRecursiveOneof;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -72,6 +53,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -131,12 +113,13 @@ public class LiteTest {
     output.flush();
     // This tests a bug we had once with removal right at the boundary of the array. It would throw
     // at runtime so no need to assert.
-    TestAllTypesLite.parseFrom(new ByteArrayInputStream(byteStream.toByteArray()));
+    TestAllTypesLite unused =
+        TestAllTypesLite.parseFrom(new ByteArrayInputStream(byteStream.toByteArray()));
   }
 
   @Test
   public void testLiteExtensions() throws Exception {
-    // TODO(kenton):  Unlike other features of the lite library, extensions are
+    // TODO:  Unlike other features of the lite library, extensions are
     //   implemented completely differently from the regular library.  We
     //   should probably test them more thoroughly.
 
@@ -189,20 +172,41 @@ public class LiteTest {
   }
 
   @Test
+  public void testParsedOneofSubMessageIsImmutable() throws InvalidProtocolBufferException {
+    TestAllTypesLite message =
+        TestAllTypesLite.parseFrom(
+            TestAllTypesLite.newBuilder()
+                .setOneofNestedMessage(NestedMessage.newBuilder().addDd(1234).build())
+                .build()
+                .toByteArray());
+    IntArrayList subList = (IntArrayList) message.getOneofNestedMessage().getDdList();
+    assertThat(subList.isModifiable()).isFalse();
+  }
+
+  @Test
   public void testMemoization() throws Exception {
-    TestAllExtensionsLite message = TestUtilLite.getAllLiteExtensionsSet();
+    GeneratedMessageLite<?, ?> message = TestUtilLite.getAllLiteExtensionsSet();
+
+    // This built message should not be mutable
+    assertThat(message.isMutable()).isFalse();
 
     // Test serialized size is memoized
-    message.memoizedSerializedSize = -1;
+    assertThat(message.getMemoizedSerializedSize())
+        .isEqualTo(GeneratedMessageLite.UNINITIALIZED_SERIALIZED_SIZE);
     int size = message.getSerializedSize();
     assertThat(size).isGreaterThan(0);
-    assertThat(message.memoizedSerializedSize).isEqualTo(size);
+    assertThat(message.getMemoizedSerializedSize()).isEqualTo(size);
+    message.clearMemoizedSerializedSize();
+    assertThat(message.getMemoizedSerializedSize())
+        .isEqualTo(GeneratedMessageLite.UNINITIALIZED_SERIALIZED_SIZE);
 
     // Test hashCode is memoized
-    assertThat(message.memoizedHashCode).isEqualTo(0);
+    assertThat(message.hashCodeIsNotMemoized()).isTrue();
     int hashCode = message.hashCode();
-    assertThat(hashCode).isNotEqualTo(0);
-    assertThat(hashCode).isEqualTo(message.memoizedHashCode);
+    assertThat(message.hashCodeIsNotMemoized()).isFalse();
+    assertThat(message.getMemoizedHashCode()).isEqualTo(hashCode);
+    message.clearMemoizedHashCode();
+    assertThat(message.hashCodeIsNotMemoized()).isTrue();
 
     // Test isInitialized is memoized
     Field memo = message.getClass().getDeclaredField("memoizedIsInitialized");
@@ -212,6 +216,22 @@ public class LiteTest {
     assertThat(initialized).isTrue();
     // We have to cast to Byte first. Casting to byte causes a type error
     assertThat(((Byte) memo.get(message)).intValue()).isEqualTo(1);
+  }
+
+  @Test
+  public void testProto3EnumListValueCopyOnWrite() {
+    Proto3MessageLite.Builder builder = Proto3MessageLite.newBuilder();
+
+    Proto3MessageLite message = builder.build();
+    builder.addFieldEnumList30Value(Proto3MessageLite.TestEnum.ONE_VALUE);
+    assertThat(message.getFieldEnumList30List()).isEmpty();
+    assertThat(builder.getFieldEnumList30List()).containsExactly(Proto3MessageLite.TestEnum.ONE);
+    assertThat(message.getFieldEnumList30List()).isEmpty();
+    Proto3MessageLite messageAfterBuild = builder.build();
+    builder.clearFieldEnumList30();
+    assertThat(builder.getFieldEnumList30List()).isEmpty();
+    assertThat(messageAfterBuild.getFieldEnumList30List())
+        .containsExactly(Proto3MessageLite.TestEnum.ONE);
   }
 
   @Test
@@ -1345,6 +1365,7 @@ public class LiteTest {
   }
 
   @Test
+  @SuppressWarnings("ProtoNewBuilderMergeFrom")
   public void testBuilderMergeFromNull() throws Exception {
     try {
       TestAllTypesLite.newBuilder().mergeFrom((TestAllTypesLite) null);
@@ -1497,7 +1518,6 @@ public class LiteTest {
     proto = TestAllTypesLite.newBuilder().setOptionalFloat(2.72f).setOptionalDouble(3.14).build();
     assertToStringEquals("optional_double: 3.14\noptional_float: 2.72", proto);
   }
-
 
   @Test
   public void testToStringStringFields() throws Exception {
@@ -1899,6 +1919,7 @@ public class LiteTest {
   }
 
   @Test
+  @SuppressWarnings("ProtoNewBuilderMergeFrom")
   public void testMergeFromNoLazyFieldSharing() throws Exception {
     TestAllTypesLite.Builder sourceBuilder =
         TestAllTypesLite.newBuilder().setOptionalLazyMessage(NestedMessage.newBuilder().setBb(1));
@@ -2337,8 +2358,7 @@ public class LiteTest {
     Foo fooWithOnlyValue = Foo.newBuilder().setValue(1).build();
 
     Foo fooWithValueAndExtension =
-        fooWithOnlyValue
-            .toBuilder()
+        fooWithOnlyValue.toBuilder()
             .setValue(1)
             .setExtension(Bar.fooExt, Bar.newBuilder().setName("name").build())
             .build();
@@ -2354,8 +2374,7 @@ public class LiteTest {
     Foo fooWithOnlyValue = Foo.newBuilder().setValue(1).build();
 
     Foo fooWithValueAndExtension =
-        fooWithOnlyValue
-            .toBuilder()
+        fooWithOnlyValue.toBuilder()
             .setValue(1)
             .setExtension(Bar.fooExt, Bar.newBuilder().setName("name").build())
             .build();
@@ -2409,6 +2428,12 @@ public class LiteTest {
   }
 
   @Test
+  public void testParseFromEmptyBytes() throws Exception {
+    assertThat(TestAllTypesLite.parseFrom(new byte[] {}))
+        .isSameInstanceAs(TestAllTypesLite.getDefaultInstance());
+  }
+
+  @Test
   public void testParseFromByteBuffer() throws Exception {
     TestAllTypesLite message =
         TestAllTypesLite.newBuilder()
@@ -2442,6 +2467,211 @@ public class LiteTest {
       assertThat(TestAllTypesLite.newBuilder().setOptionalInt32(123).build())
           .isEqualTo(expected.getUnfinishedMessage());
     }
+  }
+
+  @Test
+  public void testParseFromInputStream_concurrent_nestingUnknownGroups() throws Exception {
+    int numThreads = 200;
+    ArrayList<Thread> threads = new ArrayList<>();
+
+    ByteString byteString = generateNestingGroups(99);
+    AtomicBoolean thrown = new AtomicBoolean(false);
+
+    for (int i = 0; i < numThreads; i++) {
+      Thread thread =
+          new Thread(
+              () -> {
+                try {
+                  TestAllTypesLite unused = TestAllTypesLite.parseFrom(byteString);
+                } catch (IOException e) {
+                  if (e.getMessage().contains("Protocol message had too many levels of nesting")) {
+                    thrown.set(true);
+                  }
+                }
+              });
+      thread.start();
+      threads.add(thread);
+    }
+
+    for (Thread thread : threads) {
+      thread.join();
+    }
+
+    assertThat(thrown.get()).isFalse();
+  }
+
+  @Test
+  public void testParseFromInputStream_nestingUnknownGroups() throws IOException {
+    ByteString byteString = generateNestingGroups(99);
+
+    Throwable thrown =
+        assertThrows(
+            InvalidProtocolBufferException.class, () -> TestAllTypesLite.parseFrom(byteString));
+    assertThat(thrown)
+        .hasMessageThat()
+        .doesNotContain("Protocol message had too many levels of nesting");
+  }
+
+  @Test
+  public void testParseFromInputStream_nestingUnknownGroups_exception() throws IOException {
+    ByteString byteString = generateNestingGroups(100);
+
+    Throwable thrown =
+        assertThrows(
+            InvalidProtocolBufferException.class, () -> TestAllTypesLite.parseFrom(byteString));
+    assertThat(thrown).hasMessageThat().contains("Protocol message had too many levels of nesting");
+  }
+
+  @Test
+  public void testParseFromInputStream_setRecursionLimit_exception() throws IOException {
+    ByteString byteString = generateNestingGroups(199);
+    UnknownFieldSchema<?, ?> schema = SchemaUtil.unknownFieldSetLiteSchema();
+    schema.setRecursionLimit(200);
+
+    Throwable thrown =
+        assertThrows(
+            InvalidProtocolBufferException.class, () -> TestAllTypesLite.parseFrom(byteString));
+    assertThat(thrown)
+        .hasMessageThat()
+        .doesNotContain("Protocol message had too many levels of nesting");
+    schema.setRecursionLimit(UnknownFieldSchema.DEFAULT_RECURSION_LIMIT);
+  }
+
+  @Test
+  public void testParseFromBytes_concurrent_nestingUnknownGroups() throws Exception {
+    int numThreads = 200;
+    ArrayList<Thread> threads = new ArrayList<>();
+
+    ByteString byteString = generateNestingGroups(99);
+    AtomicBoolean thrown = new AtomicBoolean(false);
+
+    for (int i = 0; i < numThreads; i++) {
+      Thread thread =
+          new Thread(
+              () -> {
+                try {
+                  // Should pass in byte[] instead of ByteString to go into ArrayDecoders.
+                  TestAllTypesLite unused = TestAllTypesLite.parseFrom(byteString.toByteArray());
+                } catch (InvalidProtocolBufferException e) {
+                  if (e.getMessage().contains("Protocol message had too many levels of nesting")) {
+                    thrown.set(true);
+                  }
+                }
+              });
+      thread.start();
+      threads.add(thread);
+    }
+
+    for (Thread thread : threads) {
+      thread.join();
+    }
+
+    assertThat(thrown.get()).isFalse();
+  }
+
+  @Test
+  public void testParseFromBytes_nestingUnknownGroups() throws IOException {
+    ByteString byteString = generateNestingGroups(99);
+
+    Throwable thrown =
+        assertThrows(
+            InvalidProtocolBufferException.class,
+            () -> TestAllTypesLite.parseFrom(byteString.toByteArray()));
+    assertThat(thrown)
+        .hasMessageThat()
+        .doesNotContain("Protocol message had too many levels of nesting");
+  }
+
+  @Test
+  public void testParseFromBytes_nestingUnknownGroups_exception() throws IOException {
+    ByteString byteString = generateNestingGroups(100);
+
+    Throwable thrown =
+        assertThrows(
+            InvalidProtocolBufferException.class,
+            () -> TestAllTypesLite.parseFrom(byteString.toByteArray()));
+    assertThat(thrown).hasMessageThat().contains("Protocol message had too many levels of nesting");
+  }
+
+  @Test
+  public void testParseFromBytes_setRecursionLimit_exception() throws IOException {
+    ByteString byteString = generateNestingGroups(199);
+    ArrayDecoders.setRecursionLimit(200);
+
+    Throwable thrown =
+        assertThrows(
+            InvalidProtocolBufferException.class,
+            () -> TestAllTypesLite.parseFrom(byteString.toByteArray()));
+    assertThat(thrown)
+        .hasMessageThat()
+        .doesNotContain("Protocol message had too many levels of nesting");
+    ArrayDecoders.setRecursionLimit(ArrayDecoders.DEFAULT_RECURSION_LIMIT);
+  }
+
+  @Test
+  public void testParseFromBytes_recursiveMessages() throws Exception {
+    byte[] data99 = makeRecursiveMessage(99).toByteArray();
+    byte[] data100 = makeRecursiveMessage(100).toByteArray();
+
+    RecursiveMessage unused = RecursiveMessage.parseFrom(data99);
+    Throwable thrown =
+        assertThrows(
+            InvalidProtocolBufferException.class, () -> RecursiveMessage.parseFrom(data100));
+    assertThat(thrown).hasMessageThat().contains("Protocol message had too many levels of nesting");
+  }
+
+  @Test
+  public void testParseFromBytes_recursiveKnownGroups() throws Exception {
+    byte[] data99 = makeRecursiveGroup(99).toByteArray();
+    byte[] data100 = makeRecursiveGroup(100).toByteArray();
+
+    RecursiveGroup unused = RecursiveGroup.parseFrom(data99);
+    Throwable thrown =
+        assertThrows(InvalidProtocolBufferException.class, () -> RecursiveGroup.parseFrom(data100));
+    assertThat(thrown).hasMessageThat().contains("Protocol message had too many levels of nesting");
+  }
+
+  @Test
+  @SuppressWarnings("ProtoParseFromByteString")
+  public void testMaliciousSGroupTagsWithMapField_fromByteArray() throws Exception {
+    ByteString byteString = generateNestingGroups(102);
+
+    Throwable parseFromThrown =
+        assertThrows(
+            InvalidProtocolBufferException.class,
+            () -> MapContainer.parseFrom(byteString.toByteArray()));
+    Throwable mergeFromThrown =
+        assertThrows(
+            InvalidProtocolBufferException.class,
+            () -> MapContainer.newBuilder().mergeFrom(byteString.toByteArray()));
+
+    assertThat(parseFromThrown)
+        .hasMessageThat()
+        .contains("Protocol message had too many levels of nesting");
+    assertThat(mergeFromThrown)
+        .hasMessageThat()
+        .contains("Protocol message had too many levels of nesting");
+  }
+
+  @Test
+  public void testMaliciousSGroupTagsWithMapField_fromInputStream() throws Exception {
+    byte[] bytes = generateNestingGroups(101).toByteArray();
+
+    Throwable parseFromThrown =
+        assertThrows(
+            InvalidProtocolBufferException.class,
+            () -> MapContainer.parseFrom(new ByteArrayInputStream(bytes)));
+    Throwable mergeFromThrown =
+        assertThrows(
+            InvalidProtocolBufferException.class,
+            () -> MapContainer.newBuilder().mergeFrom(new ByteArrayInputStream(bytes)));
+
+    assertThat(parseFromThrown)
+        .hasMessageThat()
+        .contains("Protocol message had too many levels of nesting");
+    assertThat(mergeFromThrown)
+        .hasMessageThat()
+        .contains("Protocol message had too many levels of nesting");
   }
 
   @Test
@@ -2703,7 +2933,7 @@ public class LiteTest {
   @Test
   public void testNullExtensionRegistry() throws Exception {
     try {
-      TestAllTypesLite.parseFrom(new byte[] {}, null);
+      TestAllTypesLite.parseFrom(TestUtilLite.getAllLiteSetBuilder().build().toByteArray(), null);
       assertWithMessage("expected exception").fail();
     } catch (NullPointerException expected) {
     }
@@ -2782,7 +3012,7 @@ public class LiteTest {
     assertThat(message1).isNotEqualTo(message2);
   }
 
-  private String encodeHex(ByteString bytes) {
+  private static String encodeHex(ByteString bytes) {
     String hexDigits = "0123456789abcdef";
     StringBuilder stringBuilder = new StringBuilder(bytes.size() * 2);
     for (byte b : bytes) {
@@ -2792,12 +3022,39 @@ public class LiteTest {
     return stringBuilder.toString();
   }
 
-  private boolean contains(ByteString a, ByteString b) {
+  private static boolean contains(ByteString a, ByteString b) {
     for (int i = 0; i <= a.size() - b.size(); ++i) {
       if (a.substring(i, i + b.size()).equals(b)) {
         return true;
       }
     }
     return false;
+  }
+
+  private static ByteString generateNestingGroups(int num) throws IOException {
+    int groupTap = WireFormat.makeTag(3, WireFormat.WIRETYPE_START_GROUP);
+    ByteString.Output byteStringOutput = ByteString.newOutput();
+    CodedOutputStream codedOutput = CodedOutputStream.newInstance(byteStringOutput);
+    for (int i = 0; i < num; i++) {
+      codedOutput.writeInt32NoTag(groupTap);
+    }
+    codedOutput.flush();
+    return byteStringOutput.toByteString();
+  }
+
+  private static RecursiveMessage makeRecursiveMessage(int num) {
+    if (num == 0) {
+      return RecursiveMessage.getDefaultInstance();
+    } else {
+      return RecursiveMessage.newBuilder().setRecurse(makeRecursiveMessage(num - 1)).build();
+    }
+  }
+
+  private static RecursiveGroup makeRecursiveGroup(int num) {
+    if (num == 0) {
+      return RecursiveGroup.getDefaultInstance();
+    } else {
+      return RecursiveGroup.newBuilder().setRecurse(makeRecursiveGroup(num - 1)).build();
+    }
   }
 }

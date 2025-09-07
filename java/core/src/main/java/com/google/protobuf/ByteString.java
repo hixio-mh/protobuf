@@ -1,35 +1,13 @@
 // Protocol Buffers - Google's data interchange format
 // Copyright 2008 Google Inc.  All rights reserved.
-// https://developers.google.com/protocol-buffers/
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//     * Redistributions of source code must retain the above copyright
-// notice, this list of conditions and the following disclaimer.
-//     * Redistributions in binary form must reproduce the above
-// copyright notice, this list of conditions and the following disclaimer
-// in the documentation and/or other materials provided with the
-// distribution.
-//     * Neither the name of Google Inc. nor the names of its
-// contributors may be used to endorse or promote products derived from
-// this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
 
 package com.google.protobuf;
 
+import static com.google.protobuf.Internal.checkNotNull;
 import static com.google.protobuf.TextFormatEscaper.escapeBytes;
 import static java.lang.Integer.toHexString;
 import static java.lang.System.identityHashCode;
@@ -44,6 +22,8 @@ import java.io.OutputStream;
 import java.io.Serializable;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.InvalidMarkException;
 import java.nio.charset.Charset;
 import java.nio.charset.UnsupportedCharsetException;
 import java.util.ArrayList;
@@ -75,6 +55,7 @@ import java.util.NoSuchElementException;
  */
 @CheckReturnValue
 public abstract class ByteString implements Iterable<Byte>, Serializable {
+  private static final long serialVersionUID = 1L;
 
   /**
    * When two strings to be concatenated have a combined length shorter than this, we just copy
@@ -236,6 +217,11 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     return size() == 0;
   }
 
+  /** Returns an empty {@code ByteString} of size {@code 0}. */
+  public static final ByteString empty() {
+    return EMPTY;
+  }
+
   // =================================================================
   // Comparison
 
@@ -253,6 +239,38 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     return value & UNSIGNED_BYTE_MASK;
   }
 
+  /** Returns the numeric value of the given character in hex, or -1 if invalid. */
+  private static int hexDigit(char c) {
+    if (c >= '0' && c <= '9') {
+      return c - '0';
+    } else if (c >= 'A' && c <= 'F') {
+      return c - 'A' + 10;
+    } else if (c >= 'a' && c <= 'f') {
+      return c - 'a' + 10;
+    } else {
+      return -1;
+    }
+  }
+
+  /**
+   * Returns the numeric value of the given character at index in hexString.
+   *
+   * @throws NumberFormatException if the hexString character is invalid.
+   */
+  private static int extractHexDigit(String hexString, int index) {
+    int digit = hexDigit(hexString.charAt(index));
+    if (digit == -1) {
+      throw new NumberFormatException(
+          "Invalid hexString "
+              + hexString
+              + " must only contain [0-9a-fA-F] but contained "
+              + hexString.charAt(index)
+              + " at index "
+              + index);
+    }
+    return digit;
+  }
+
   /**
    * Compares two {@link ByteString}s lexicographically, treating their contents as unsigned byte
    * values between 0 and 255 (inclusive).
@@ -268,19 +286,19 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
           ByteIterator latterBytes = latter.iterator();
 
           while (formerBytes.hasNext() && latterBytes.hasNext()) {
-            int result = Integer.valueOf(toInt(formerBytes.nextByte()))
-                .compareTo(toInt(latterBytes.nextByte()));
+            int result =
+                Integer.compare(toInt(formerBytes.nextByte()), toInt(latterBytes.nextByte()));
             if (result != 0) {
               return result;
             }
           }
-          return Integer.valueOf(former.size()).compareTo(Integer.valueOf(latter.size()));
+          return Integer.compare(former.size(), latter.size());
         }
       };
 
   /**
-   * Returns a {@link Comparator} which compares {@link ByteString}-s lexicographically
-   * as sequences of unsigned byte values between 0 and 255, inclusive.
+   * Returns a {@link Comparator} which compares {@link ByteString}-s lexicographically as sequences
+   * of unsigned bytes (i.e. values between 0 and 255, inclusive).
    *
    * <p>For example, {@code (byte) -1} is considered to be greater than {@code (byte) 1} because it
    * is interpreted as an unsigned value, {@code 255}:
@@ -344,6 +362,29 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
   }
 
   // =================================================================
+  // String -> ByteString
+
+  /**
+   * Returns a {@code ByteString} from a hexadecimal String.
+   *
+   * @param hexString String of hexadecimal digits to create {@code ByteString} from.
+   * @throws NumberFormatException if the hexString does not contain a parsable hex String.
+   */
+  public static ByteString fromHex(@CompileTimeConstant String hexString) {
+    if (hexString.length() % 2 != 0) {
+      throw new NumberFormatException(
+          "Invalid hexString " + hexString + " of length " + hexString.length() + " must be even.");
+    }
+    byte[] bytes = new byte[hexString.length() / 2];
+    for (int i = 0; i < bytes.length; i++) {
+      int d1 = extractHexDigit(hexString, 2 * i);
+      int d2 = extractHexDigit(hexString, 2 * i + 1);
+      bytes[i] = (byte) (d1 << 4 | d2);
+    }
+    return new LiteralByteString(bytes);
+  }
+
+  // =================================================================
   // byte[] -> ByteString
 
   /**
@@ -370,7 +411,10 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     return copyFrom(bytes, 0, bytes.length);
   }
 
-  /** Wraps the given bytes into a {@code ByteString}. Intended for internal only usage. */
+  /**
+   * Wraps the given bytes into a {@code ByteString}. Intended for internal usage within the
+   * library.
+   */
   static ByteString wrap(ByteBuffer buffer) {
     if (buffer.hasArray()) {
       final int offset = buffer.arrayOffset();
@@ -380,18 +424,23 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     }
   }
 
+  // For use in tests
+  static ByteString nioByteString(ByteBuffer buffer) {
+    return new NioByteString(buffer);
+  }
+
   /**
-   * Wraps the given bytes into a {@code ByteString}. Intended for internal only usage to force a
-   * classload of ByteString before LiteralByteString.
+   * Wraps the given bytes into a {@code ByteString}. Intended for internal usage within the library
+   * to force a classload of ByteString before LiteralByteString.
    */
   static ByteString wrap(byte[] bytes) {
-    // TODO(dweis): Return EMPTY when bytes are empty to reduce allocations?
+    // TODO: Return EMPTY when bytes are empty to reduce allocations?
     return new LiteralByteString(bytes);
   }
 
   /**
-   * Wraps the given bytes into a {@code ByteString}. Intended for internal only usage to force a
-   * classload of ByteString before BoundedByteString and LiteralByteString.
+   * Wraps the given bytes into a {@code ByteString}. Intended for internal usage within the library
+   * to force a classload of ByteString before BoundedByteString and LiteralByteString.
    */
   static ByteString wrap(byte[] bytes, int offset, int length) {
     return new BoundedByteString(bytes, offset, length);
@@ -880,10 +929,13 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
   // equals() and hashCode()
 
   @Override
-  public abstract boolean equals(Object o);
+  public abstract boolean equals(
+          Object o);
 
   /** Base class for leaf {@link ByteString}s (i.e. non-ropes). */
   abstract static class LeafByteString extends ByteString {
+    private static final long serialVersionUID = 1L;
+
     @Override
     protected final int getTreeDepth() {
       return 0;
@@ -909,6 +961,8 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
      * @return true for equality of substrings, else false.
      */
     abstract boolean equalsRange(ByteString other, int offset, int length);
+
+    private LeafByteString() {}
   }
 
   /**
@@ -998,7 +1052,7 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     // Implementation note.
     // The public methods of this class must be synchronized.  ByteStrings
     // are guaranteed to be immutable.  Without some sort of locking, it could
-    // be possible for one thread to call toByteSring(), while another thread
+    // be possible for one thread to call toByteString(), while another thread
     // is still modifying the underlying byte array.
 
     private static final byte[] EMPTY_BYTE_ARRAY = new byte[0];
@@ -1068,13 +1122,6 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
       return ByteString.copyFrom(flushedBuffers);
     }
 
-    /** Implement java.util.Arrays.copyOf() for jdk 1.5. */
-    private byte[] copyArray(byte[] buffer, int length) {
-      byte[] result = new byte[length];
-      System.arraycopy(buffer, 0, result, 0, Math.min(buffer.length, length));
-      return result;
-    }
-
     /**
      * Writes the complete contents of this byte array output stream to the specified output stream
      * argument.
@@ -1089,7 +1136,7 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
       synchronized (this) {
         // Copy the information we need into local variables so as to hold
         // the lock for as short a time as possible.
-        cachedFlushBuffers = flushedBuffers.toArray(new ByteString[flushedBuffers.size()]);
+        cachedFlushBuffers = flushedBuffers.toArray(new ByteString[0]);
         cachedBuffer = buffer;
         cachedBufferPos = bufferPos;
       }
@@ -1097,7 +1144,7 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
         byteString.writeTo(out);
       }
 
-      out.write(copyArray(cachedBuffer, cachedBufferPos));
+      out.write(Arrays.copyOf(cachedBuffer, cachedBufferPos));
     }
 
     /**
@@ -1148,7 +1195,7 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     private void flushLastBuffer() {
       if (bufferPos < buffer.length) {
         if (bufferPos > 0) {
-          byte[] bufferCopy = copyArray(buffer, bufferPos);
+          byte[] bufferCopy = Arrays.copyOf(buffer, bufferPos);
           flushedBuffers.add(new LiteralByteString(bufferCopy));
         }
         // We reuse this buffer for further writes.
@@ -1373,7 +1420,7 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
         byte[] target, int sourceOffset, int targetOffset, int numberToCopy) {
       // Optimized form, not for subclasses, since we don't call
       // getOffsetIntoBytes() or check the 'numberToCopy' parameter.
-      // TODO(nathanmittler): Is not calling getOffsetIntoBytes really saving that much?
+      // TODO: Is not calling getOffsetIntoBytes really saving that much?
       System.arraycopy(bytes, sourceOffset, target, targetOffset, numberToCopy);
     }
 
@@ -1432,7 +1479,8 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     // equals() and hashCode()
 
     @Override
-    public final boolean equals(Object other) {
+    public final boolean equals(
+            Object other) {
       if (other == this) {
         return true;
       }
@@ -1549,7 +1597,6 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
   // Keep this class private to avoid deadlocks in classloading across threads as ByteString's
   // static initializer loads LiteralByteString and another thread loads BoundedByteString.
   private static final class BoundedByteString extends LiteralByteString {
-
     private final int bytesOffset;
     private final int bytesLength;
 
@@ -1624,6 +1671,257 @@ public abstract class ByteString implements Iterable<Byte>, Serializable {
     private void readObject(@SuppressWarnings("unused") ObjectInputStream in) throws IOException {
       throw new InvalidObjectException(
           "BoundedByteStream instances are not to be serialized directly");
+    }
+  }
+
+  /** A {@link ByteString} that wraps around a {@link ByteBuffer}. */
+  // Keep this class private to avoid deadlocks in classloading across threads as ByteString's
+  // static initializer loads LiteralByteString and another thread loads BoundedByteString.
+  private static final class NioByteString extends ByteString.LeafByteString {
+    private final ByteBuffer buffer;
+
+    NioByteString(ByteBuffer buffer) {
+      checkNotNull(buffer, "buffer");
+
+      // Use native byte order for fast fixed32/64 operations.
+      this.buffer = buffer.slice().order(ByteOrder.nativeOrder());
+    }
+
+    // =================================================================
+    // Serializable
+
+    /** Magic method that lets us override serialization behavior. */
+    private Object writeReplace() {
+      return ByteString.copyFrom(buffer.slice());
+    }
+
+    /** Magic method that lets us override deserialization behavior. */
+    private void readObject(@SuppressWarnings("unused") ObjectInputStream in) throws IOException {
+      throw new InvalidObjectException("NioByteString instances are not to be serialized directly");
+    }
+
+    // =================================================================
+
+    @Override
+    public byte byteAt(int index) {
+      try {
+        return buffer.get(index);
+      } catch (ArrayIndexOutOfBoundsException e) {
+        throw e;
+      } catch (IndexOutOfBoundsException e) {
+        throw new ArrayIndexOutOfBoundsException(e.getMessage());
+      }
+    }
+
+    @Override
+    public byte internalByteAt(int index) {
+      // it isn't possible to avoid the bounds checking inside of ByteBuffer, so just use the
+      // default
+      // implementation.
+      return byteAt(index);
+    }
+
+    @Override
+    public int size() {
+      return buffer.remaining();
+    }
+
+    @Override
+    public ByteString substring(int beginIndex, int endIndex) {
+      try {
+        ByteBuffer slice = slice(beginIndex, endIndex);
+        return new NioByteString(slice);
+      } catch (ArrayIndexOutOfBoundsException e) {
+        throw e;
+      } catch (IndexOutOfBoundsException e) {
+        throw new ArrayIndexOutOfBoundsException(e.getMessage());
+      }
+    }
+
+    @Override
+    protected void copyToInternal(
+        byte[] target, int sourceOffset, int targetOffset, int numberToCopy) {
+      ByteBuffer slice = buffer.slice();
+      Java8Compatibility.position(slice, sourceOffset);
+      slice.get(target, targetOffset, numberToCopy);
+    }
+
+    @Override
+    public void copyTo(ByteBuffer target) {
+      target.put(buffer.slice());
+    }
+
+    @Override
+    public void writeTo(OutputStream out) throws IOException {
+      out.write(toByteArray());
+    }
+
+    @Override
+    boolean equalsRange(ByteString other, int offset, int length) {
+      return substring(0, length).equals(other.substring(offset, offset + length));
+    }
+
+    @Override
+    void writeToInternal(OutputStream out, int sourceOffset, int numberToWrite) throws IOException {
+      if (buffer.hasArray()) {
+        // Optimized write for array-backed buffers.
+        // Note that we're taking the risk that a malicious OutputStream could modify the array.
+        int bufferOffset = buffer.arrayOffset() + buffer.position() + sourceOffset;
+        out.write(buffer.array(), bufferOffset, numberToWrite);
+        return;
+      }
+
+      ByteBufferWriter.write(slice(sourceOffset, sourceOffset + numberToWrite), out);
+    }
+
+    @Override
+    void writeTo(ByteOutput output) throws IOException {
+      output.writeLazy(buffer.slice());
+    }
+
+    @Override
+    public ByteBuffer asReadOnlyByteBuffer() {
+      return buffer.asReadOnlyBuffer();
+    }
+
+    @Override
+    public List<ByteBuffer> asReadOnlyByteBufferList() {
+      return Collections.singletonList(asReadOnlyByteBuffer());
+    }
+
+    @Override
+    protected String toStringInternal(Charset charset) {
+      final byte[] bytes;
+      final int offset;
+      final int length;
+      if (buffer.hasArray()) {
+        bytes = buffer.array();
+        offset = buffer.arrayOffset() + buffer.position();
+        length = buffer.remaining();
+      } else {
+        // TODO: Can we optimize this?
+        bytes = toByteArray();
+        offset = 0;
+        length = bytes.length;
+      }
+      return new String(bytes, offset, length, charset);
+    }
+
+    @Override
+    public boolean isValidUtf8() {
+      return Utf8.isValidUtf8(buffer);
+    }
+
+    @Override
+    protected int partialIsValidUtf8(int state, int offset, int length) {
+      return Utf8.partialIsValidUtf8(state, buffer, offset, offset + length);
+    }
+
+    @Override
+    public boolean equals(
+            Object other) {
+      if (other == this) {
+        return true;
+      }
+      if (!(other instanceof ByteString)) {
+        return false;
+      }
+      ByteString otherString = ((ByteString) other);
+      if (size() != otherString.size()) {
+        return false;
+      }
+      if (size() == 0) {
+        return true;
+      }
+      if (other instanceof NioByteString) {
+        return buffer.equals(((NioByteString) other).buffer);
+      }
+      if (other instanceof RopeByteString) {
+        return other.equals(this);
+      }
+      return buffer.equals(otherString.asReadOnlyByteBuffer());
+    }
+
+    @Override
+    protected int partialHash(int h, int offset, int length) {
+      for (int i = offset; i < offset + length; i++) {
+        h = h * 31 + buffer.get(i);
+      }
+      return h;
+    }
+
+    @Override
+    public InputStream newInput() {
+      return new InputStream() {
+        private final ByteBuffer buf = buffer.slice();
+
+        @Override
+        public void mark(int readlimit) {
+          Java8Compatibility.mark(buf);
+        }
+
+        @Override
+        public boolean markSupported() {
+          return true;
+        }
+
+        @Override
+        public void reset() throws IOException {
+          try {
+            Java8Compatibility.reset(buf);
+          } catch (InvalidMarkException e) {
+            throw new IOException(e);
+          }
+        }
+
+        @Override
+        public int available() throws IOException {
+          return buf.remaining();
+        }
+
+        @Override
+        public int read() throws IOException {
+          if (!buf.hasRemaining()) {
+            return -1;
+          }
+          return buf.get() & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] bytes, int off, int len) throws IOException {
+          if (!buf.hasRemaining()) {
+            return -1;
+          }
+
+          len = Math.min(len, buf.remaining());
+          buf.get(bytes, off, len);
+          return len;
+        }
+      };
+    }
+
+    @Override
+    public CodedInputStream newCodedInput() {
+      return CodedInputStream.newInstance(buffer, true);
+    }
+
+    /**
+     * Creates a slice of a range of this buffer.
+     *
+     * @param beginIndex the beginning index of the slice (inclusive).
+     * @param endIndex the end index of the slice (exclusive).
+     * @return the requested slice.
+     */
+    private ByteBuffer slice(int beginIndex, int endIndex) {
+      if (beginIndex < buffer.position() || endIndex > buffer.limit() || beginIndex > endIndex) {
+        throw new IllegalArgumentException(
+            String.format("Invalid indices [%d, %d]", beginIndex, endIndex));
+      }
+
+      ByteBuffer slice = buffer.slice();
+      Java8Compatibility.position(slice, beginIndex - buffer.position());
+      Java8Compatibility.limit(slice, endIndex - buffer.position());
+      return slice;
     }
   }
 }
